@@ -184,7 +184,28 @@
   </div>
 </div>
 
-<script>
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.13.2/firebase-app.js";
+import {
+  getFirestore, collection, doc, addDoc, setDoc, deleteDoc, updateDoc,
+  onSnapshot, getDocs, query, orderBy
+} from "https://www.gstatic.com/firebasejs/10.13.2/firebase-firestore.js";
+
+const firebaseConfig = {
+  apiKey: "AIzaSyDzeP02KG3N2Zb_As17Q1YpbBbi5UGiIVI",
+  authDomain: "burgurpoint-menu.firebaseapp.com",
+  projectId: "burgurpoint-menu",
+  storageBucket: "burgurpoint-menu.firebasestorage.app",
+  messagingSenderId: "24688452194",
+  appId: "1:24688452194:web:0dfad4b4f872a1d1ca273b"
+};
+const app = initializeApp(firebaseConfig);
+const db = getFirestore(app);
+
+// Change this PIN to whatever you like — it's the only thing gating the Owner Dashboard now
+// that the menu is shared live across every device. Not bulletproof security, just a basic lock.
+const OWNER_PIN = "1234";
+
 const DEFAULT_ITEMS = [
   {id:'d1', cat:'burgers', name:'Zinger Deluxe Burger', desc:'Crispy chicken, cheese, special sauce, fresh bun.', price:850, emoji:'🍔', img:null},
   {id:'d2', cat:'burgers', name:'VIP Beef Smash', desc:'Double beef patty, cheddar cheese, caramelized onions.', price:1200, emoji:'🍔', img:null},
@@ -195,17 +216,65 @@ const DEFAULT_ITEMS = [
 ];
 const DEFAULT_CATS = {burgers:{label:'Burgers', emoji:'🍔'}, pizza:{label:'Pizza', emoji:'🍕'}, drinks:{label:'Cold Drinks', emoji:'🥤'}};
 
-function loadJSON(key, fallback){ try{ const v = localStorage.getItem(key); return v ? JSON.parse(v) : fallback; }catch(e){ return fallback; } }
-function saveJSON(key, val){ try{ localStorage.setItem(key, JSON.stringify(val)); }catch(e){} }
-
-let items = loadJSON('menu_items', DEFAULT_ITEMS);
-let CATS = loadJSON('menu_categories', DEFAULT_CATS);
-let settings = loadJSON('menu_settings', {tax:5, discount:0});
-let orders = loadJSON('menu_orders', []);
-let activeCat = Object.keys(CATS)[0];
+let items = [];
+let CATS = {};
+let settings = {tax:5, discount:0};
+let orders = [];
+let activeCat = null;
 let cart = [];
 let currentItem = null;
 let qty = 1;
+
+// One-time seed: if this is a brand new Firebase project (no categories/items yet),
+// push the built-in defaults so the menu isn't empty on first load.
+(async function seedIfEmpty(){
+  try{
+    const catsSnap = await getDocs(collection(db, 'menu_categories'));
+    if(catsSnap.empty){
+      for(const key of Object.keys(DEFAULT_CATS)){
+        await setDoc(doc(db, 'menu_categories', key), DEFAULT_CATS[key]);
+      }
+    }
+    const itemsSnap = await getDocs(collection(db, 'menu_items'));
+    if(itemsSnap.empty){
+      for(const it of DEFAULT_ITEMS){
+        const {id, ...rest} = it;
+        await setDoc(doc(db, 'menu_items', id), rest);
+      }
+    }
+    const settingsSnap = await getDocs(collection(db, 'menu_settings'));
+    if(settingsSnap.empty){
+      await setDoc(doc(db, 'menu_settings', 'main'), {tax:5, discount:0});
+    }
+  }catch(e){ console.error('Seed failed:', e); }
+})();
+
+// Real-time listeners — every connected device (customer, admin, waiter) updates instantly.
+onSnapshot(collection(db, 'menu_categories'), (snap)=>{
+  CATS = {};
+  snap.forEach(d=> CATS[d.id] = d.data());
+  if(!activeCat || !CATS[activeCat]) activeCat = Object.keys(CATS)[0];
+  renderTabs(); renderGrid(); populateCatDropdown(); renderManageCats();
+});
+
+onSnapshot(collection(db, 'menu_items'), (snap)=>{
+  items = snap.docs.map(d=>({id:d.id, ...d.data()}));
+  renderGrid(); renderManageList();
+});
+
+onSnapshot(doc(db, 'menu_settings', 'main'), (snap)=>{
+  if(snap.exists()){
+    settings = snap.data();
+    document.getElementById('taxInput').value = settings.tax;
+    document.getElementById('discInput').value = settings.discount;
+    renderDashboard();
+  }
+});
+
+onSnapshot(query(collection(db, 'orders'), orderBy('ts','asc')), (snap)=>{
+  orders = snap.docs.map(d=>({id:d.id, ...d.data()}));
+  renderDashboard();
+});
 
 const tabsEl = document.getElementById('tabs');
 const gridEl = document.getElementById('grid');
@@ -268,16 +337,19 @@ function showToast(msg){
   setTimeout(()=> t.classList.remove('show'), 2200);
 }
 
-document.getElementById('addBtn').onclick = ()=>{
+document.getElementById('addBtn').onclick = async ()=>{
   const table = document.getElementById('tableInput').value.trim() || '—';
-  const order = {name:currentItem.name, emoji:currentItem.emoji, qty, table, price:currentItem.price, total:currentItem.price*qty, ts:Date.now()};
+  const order = {name:currentItem.name, emoji:currentItem.emoji, qty, table, price:currentItem.price, total:currentItem.price*qty, ts:Date.now(), status:'pending'};
   cart.push(order);
-  orders.push(order);
-  saveJSON('menu_orders', orders);
   updateCartbar();
   closeModal();
   showToast('✅ Sent to waiter — ' + currentItem.name);
-  renderDashboard();
+  try{
+    await addDoc(collection(db, 'orders'), order);
+  }catch(e){
+    console.error(e);
+    showToast('⚠️ Could not reach the kitchen — check your internet and try again.');
+  }
 };
 
 function updateCartbar(){
@@ -315,19 +387,22 @@ function openBill(){
   document.getElementById('billOverlay').classList.add('open');
 }
 document.getElementById('billClose').onclick = ()=> document.getElementById('billOverlay').classList.remove('open');
-document.getElementById('billCallWaiterBtn').onclick = ()=>{
+document.getElementById('billCallWaiterBtn').onclick = async ()=>{
+  const tableNum = cart.length ? cart[cart.length-1].table : '—';
   showToast('🔔 Waiter notified — bringing your bill shortly.');
   document.getElementById('billOverlay').classList.remove('open');
+  try{
+    await addDoc(collection(db, 'billRequests'), {table: tableNum, ts: Date.now(), status:'pending'});
+  }catch(e){ console.error(e); }
 };
 
-document.getElementById('taxInput').value = settings.tax;
-document.getElementById('discInput').value = settings.discount;
-document.getElementById('saveSettingsBtn').onclick = ()=>{
+document.getElementById('saveSettingsBtn').onclick = async ()=>{
   settings.tax = parseFloat(document.getElementById('taxInput').value) || 0;
   settings.discount = parseFloat(document.getElementById('discInput').value) || 0;
-  saveJSON('menu_settings', settings);
-  showToast('Settings saved.');
-  renderDashboard();
+  try{
+    await setDoc(doc(db, 'menu_settings', 'main'), settings);
+    showToast('Settings saved.');
+  }catch(e){ console.error(e); showToast('⚠️ Could not save settings.'); }
 };
 
 function renderDashboard(){
@@ -352,6 +427,11 @@ function renderDashboard(){
 }
 
 document.getElementById('ownerToggle').onclick = ()=>{
+  const pin = prompt('Enter Owner PIN:');
+  if(pin !== OWNER_PIN){
+    if(pin !== null) showToast('❌ Wrong PIN.');
+    return;
+  }
   document.getElementById('dashOverlay').classList.add('open');
   renderDashboard();
   populateCatDropdown();
@@ -379,17 +459,17 @@ function populateCatDropdown(){
   });
 }
 
-document.getElementById('addCatBtn').onclick = ()=>{
+document.getElementById('addCatBtn').onclick = async ()=>{
   const name = document.getElementById('newCatName').value.trim();
   const emoji = document.getElementById('newCatEmoji').value.trim() || '🍽️';
   if(!name){ showToast('Please enter a category name.'); return; }
   const id = 'c' + Date.now();
-  CATS[id] = {label:name, emoji};
-  saveJSON('menu_categories', CATS);
-  document.getElementById('newCatName').value = '';
-  document.getElementById('newCatEmoji').value = '';
-  showToast('✅ Category "' + name + '" added.');
-  renderTabs(); populateCatDropdown(); renderManageCats();
+  try{
+    await setDoc(doc(db, 'menu_categories', id), {label:name, emoji});
+    document.getElementById('newCatName').value = '';
+    document.getElementById('newCatEmoji').value = '';
+    showToast('✅ Category "' + name + '" added.');
+  }catch(e){ console.error(e); showToast('⚠️ Could not add category.'); }
 };
 
 function renderManageCats(){
@@ -402,14 +482,13 @@ function renderManageCats(){
       <div style="width:32px;text-align:center;font-size:16px;">${CATS[key].emoji}</div>
       <div style="flex:1;font-size:13px;">${CATS[key].label}</div>
       <button class="del-x" style="display:block;position:static;" data-cat="${key}">✕</button>`;
-    row.querySelector('.del-x').onclick = ()=>{
+    row.querySelector('.del-x').onclick = async ()=>{
       if(Object.keys(CATS).length <= 1){ showToast('You need at least one category.'); return; }
-      delete CATS[key];
-      items = items.filter(i=>i.cat!==key);
-      saveJSON('menu_categories', CATS);
-      saveJSON('menu_items', items);
-      if(activeCat===key) activeCat = Object.keys(CATS)[0];
-      renderTabs(); renderGrid(); populateCatDropdown(); renderManageCats(); renderManageList();
+      try{
+        const toRemove = items.filter(i=>i.cat===key);
+        await Promise.all(toRemove.map(i=> deleteDoc(doc(db, 'menu_items', i.id))));
+        await deleteDoc(doc(db, 'menu_categories', key));
+      }catch(e){ console.error(e); showToast('⚠️ Could not delete category.'); }
     };
     el.appendChild(row);
   });
@@ -459,21 +538,19 @@ document.getElementById('newImg').onchange = (e)=>{
   reader.readAsDataURL(file);
 };
 
-document.getElementById('addItemBtn').onclick = ()=>{
+document.getElementById('addItemBtn').onclick = async ()=>{
   const cat = document.getElementById('newCat').value;
   const name = document.getElementById('newName').value.trim();
   const price = parseFloat(document.getElementById('newPrice').value);
   const desc = document.getElementById('newDesc').value.trim() || 'A VIP menu special.';
   if(!name || !price){ showToast('Please enter a name and price.'); return; }
   const emojiMap = CATS[cat] ? CATS[cat].emoji : '🍽️';
-  const newItem = {id:'i'+Date.now(), cat, name, desc, price, emoji:emojiMap, img:pendingImg, model3d:pendingModel};
-  const backup = items.slice();
-  items.push(newItem);
+  const newItem = {cat, name, desc, price, emoji:emojiMap, img:pendingImg||null, model3d:pendingModel||null};
   try{
-    localStorage.setItem('menu_items', JSON.stringify(items));
+    await addDoc(collection(db, 'menu_items'), newItem);
   }catch(err){
-    items = backup;
-    showToast('⚠️ Storage full — try a smaller photo/3D file or remove an old item first.');
+    console.error(err);
+    showToast('⚠️ Could not save — try a smaller photo/3D file (Firestore limit ~1MB per item).');
     return;
   }
   pendingImg = null;
@@ -482,8 +559,7 @@ document.getElementById('addItemBtn').onclick = ()=>{
   document.getElementById('newDesc').value=''; document.getElementById('newImg').value='';
   document.getElementById('newModel').value='';
   document.getElementById('newImgPreview').style.display='none';
-  showToast('✅ Item added — visible on menu now.');
-  renderGrid(); renderManageList();
+  showToast('✅ Item added — visible on every device now.');
 };
 
 function renderManageList(){
@@ -498,10 +574,9 @@ function renderManageList(){
       </div>
       <div style="flex:1;font-size:13px;">${item.name} <span style="color:var(--muted);">— Rs. ${item.price} (${CATS[item.cat] ? CATS[item.cat].label : item.cat})</span></div>
       <button class="del-x" style="display:block;position:static;" data-id="${item.id}">✕</button>`;
-    row.querySelector('.del-x').onclick = ()=>{
-      items = items.filter(i=>i.id!==item.id);
-      saveJSON('menu_items', items);
-      renderGrid(); renderManageList();
+    row.querySelector('.del-x').onclick = async ()=>{
+      try{ await deleteDoc(doc(db, 'menu_items', item.id)); }
+      catch(e){ console.error(e); showToast('⚠️ Could not delete item.'); }
     };
     el.appendChild(row);
   });

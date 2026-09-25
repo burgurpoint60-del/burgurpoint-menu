@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Waiter Panel</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root{ --bg:#150f0c; --gold:#cf9b3f; --gold-light:#e8c179; --cream:#f3e9d8; --muted:#a99a86; --card:#231a14; --shadow:0 20px 50px rgba(0,0,0,.55); }
+  html,body{height:100%;} *{box-sizing:border-box;}
+  body{ margin:0; background:radial-gradient(1200px 600px at 50% -10%, #2a2016 0%, var(--bg) 60%); color:var(--cream); font-family:'Inter',sans-serif; padding-top:env(safe-area-inset-top,0px); padding-bottom:env(safe-area-inset-bottom,0px); min-height:100%; }
+  .hero{ padding:24px 20px 14px; text-align:center; }
+  .hero h1{ font-size:22px; margin:0 0 4px; }
+  .hero .eyebrow{ font-size:12px; letter-spacing:2px; color:var(--gold-light); text-transform:uppercase; }
+  .status{ text-align:center; font-size:12px; color:var(--muted); margin-bottom:10px; }
+  .status.online{ color:#6fbf73; }
+  .status.offline{ color:#c96b6b; }
+  .wrap{ max-width:520px; margin:0 auto; padding:0 16px 40px; }
+  .section-title{ font-size:13px; text-transform:uppercase; letter-spacing:1px; color:var(--muted); margin:22px 4px 10px; }
+  .empty{ text-align:center; color:var(--muted); font-size:14px; padding:30px 10px; }
+  .card{ background:linear-gradient(160deg,var(--card),#171009); border:1px solid rgba(207,155,63,.35); border-radius:14px; padding:14px 16px; margin-bottom:12px; box-shadow:var(--shadow); animation:pop .25s ease; }
+  @keyframes pop{ from{ transform:scale(.96); opacity:0; } to{ transform:scale(1); opacity:1; } }
+  .card.new{ border-color:var(--gold); box-shadow:0 0 0 2px rgba(207,155,63,.5), var(--shadow); }
+  .card-top{ display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:8px; }
+  .table-tag{ font-size:12px; font-weight:700; color:#20150a; background:var(--gold); padding:4px 10px; border-radius:999px; }
+  .time-tag{ font-size:11px; color:var(--muted); }
+  .item-line{ font-size:15px; margin:2px 0; }
+  .item-line b{ color:var(--gold-light); }
+  .btn{ width:100%; margin-top:10px; padding:11px; border-radius:10px; border:none; font-size:14px; font-weight:600; cursor:pointer; background:var(--gold); color:#20150a; }
+  .btn:active{ transform:scale(.98); }
+  .bill-card{ border-color:#c9834f; }
+  .bill-card .btn{ background:#c9834f; }
+</style>
+</head>
+<body>
+
+<div class="hero">
+  <div class="eyebrow">STAFF ONLY</div>
+  <h1>🔔 Waiter Panel</h1>
+</div>
+<div class="status" id="statusLine">Connecting…</div>
+
+<div class="wrap">
+  <div class="section-title">🧾 Bill Requests</div>
+  <div id="billList"><div class="empty">No bill requests right now.</div></div>
+
+  <div class="section-title">🍽️ New Orders</div>
+  <div id="orderList"><div class="empty">No pending orders right now.</div></div>
+</div>
+
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.13.2/firebase-app.js";
+import {
+  getFirestore, collection, doc, updateDoc, onSnapshot, query, where, orderBy
+} from "https://www.gstatic.com/firebasejs/10.13.2/firebase-firestore.js";
+
+const firebaseConfig = {
+  apiKey: "AIzaSyDzeP02KG3N2Zb_As17Q1YpbBbi5UGiIVI",
+  authDomain: "burgurpoint-menu.firebaseapp.com",
+  projectId: "burgurpoint-menu",
+  storageBucket: "burgurpoint-menu.firebasestorage.app",
+  messagingSenderId: "24688452194",
+  appId: "1:24688452194:web:0dfad4b4f872a1d1ca273b"
+};
+const app = initializeApp(firebaseConfig);
+const db = getFirestore(app);
+
+const statusLine = document.getElementById('statusLine');
+statusLine.textContent = '● Connected — listening for orders';
+statusLine.className = 'status online';
+
+let knownOrderIds = new Set();
+let knownBillIds = new Set();
+let firstOrderLoad = true;
+let firstBillLoad = true;
+
+function beep(){
+  try{
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const o = ctx.createOscillator();
+    const g = ctx.createGain();
+    o.type = 'sine'; o.frequency.value = 880;
+    g.gain.setValueAtTime(0.15, ctx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.4);
+    o.connect(g); g.connect(ctx.destination);
+    o.start(); o.stop(ctx.currentTime + 0.4);
+  }catch(e){}
+}
+
+function timeAgo(ts){
+  const diff = Math.floor((Date.now() - ts)/1000);
+  if(diff < 60) return 'just now';
+  if(diff < 3600) return Math.floor(diff/60) + 'm ago';
+  return Math.floor(diff/3600) + 'h ago';
+}
+
+// Pending orders — oldest first
+const ordersQuery = query(collection(db, 'orders'), where('status','==','pending'), orderBy('ts','asc'));
+onSnapshot(ordersQuery, (snap)=>{
+  const list = document.getElementById('orderList');
+  if(snap.empty){
+    list.innerHTML = '<div class="empty">No pending orders right now.</div>';
+  } else {
+    list.innerHTML = '';
+    snap.forEach(d=>{
+      const o = d.data();
+      const isNew = !knownOrderIds.has(d.id) && !firstOrderLoad;
+      const card = document.createElement('div');
+      card.className = 'card' + (isNew ? ' new' : '');
+      card.innerHTML = `
+        <div class="card-top">
+          <span class="table-tag">Table ${o.table}</span>
+          <span class="time-tag">${timeAgo(o.ts)}</span>
+        </div>
+        <div class="item-line">${o.emoji||''} <b>${o.name}</b> × ${o.qty}</div>
+        <button class="btn">✅ Mark Served</button>`;
+      card.querySelector('.btn').onclick = async ()=>{
+        card.style.opacity = '0.5';
+        try{ await updateDoc(doc(db, 'orders', d.id), {status:'served'}); }
+        catch(e){ console.error(e); card.style.opacity = '1'; }
+      };
+      list.appendChild(card);
+    });
+  }
+  const currentIds = new Set(snap.docs.map(d=>d.id));
+  if(!firstOrderLoad){
+    let hasNew = false;
+    currentIds.forEach(id=>{ if(!knownOrderIds.has(id)) hasNew = true; });
+    if(hasNew) beep();
+  }
+  knownOrderIds = currentIds;
+  firstOrderLoad = false;
+});
+
+// Pending bill requests — oldest first
+const billsQuery = query(collection(db, 'billRequests'), where('status','==','pending'), orderBy('ts','asc'));
+onSnapshot(billsQuery, (snap)=>{
+  const list = document.getElementById('billList');
+  if(snap.empty){
+    list.innerHTML = '<div class="empty">No bill requests right now.</div>';
+  } else {
+    list.innerHTML = '';
+    snap.forEach(d=>{
+      const b = d.data();
+      const card = document.createElement('div');
+      card.className = 'card bill-card';
+      card.innerHTML = `
+        <div class="card-top">
+          <span class="table-tag" style="background:#c9834f;">Table ${b.table}</span>
+          <span class="time-tag">${timeAgo(b.ts)}</span>
+        </div>
+        <div class="item-line">🧾 Wants the bill</div>
+        <button class="btn">Resolved</button>`;
+      card.querySelector('.btn').onclick = async ()=>{
+        card.style.opacity = '0.5';
+        try{ await updateDoc(doc(db, 'billRequests', d.id), {status:'done'}); }
+        catch(e){ console.error(e); card.style.opacity = '1'; }
+      };
+      list.appendChild(card);
+    });
+  }
+  const currentIds = new Set(snap.docs.map(d=>d.id));
+  if(!firstBillLoad){
+    let hasNew = false;
+    currentIds.forEach(id=>{ if(!knownBillIds.has(id)) hasNew = true; });
+    if(hasNew) beep();
+  }
+  knownBillIds = currentIds;
+  firstBillLoad = false;
+});
+
+window.addEventListener('offline', ()=>{ statusLine.textContent = '● Offline'; statusLine.className='status offline'; });
+window.addEventListener('online', ()=>{ statusLine.textContent = '● Connected — listening for orders'; statusLine.className='status online'; });
+</script>
+</body>
+</html>
